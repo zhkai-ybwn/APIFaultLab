@@ -1,0 +1,31 @@
+{
+  "format": "apifaultlab-catalog",
+  "schemaVersion": 1,
+  "page": "http://127.0.0.1:4173/orders",
+  "operations": [
+    {
+      "id": "list-orders",
+      "title": "查询订单",
+      "method": "POST",
+      "origin": "http://127.0.0.1:4173",
+      "path": "/api/query",
+      "source": "documented",
+      "conditions": [
+        { "source": "json", "path": "/operationName", "value": "ListOrders" }
+      ],
+      "contentType": "application/json"
+    },
+    {
+      "id": "list-customers",
+      "title": "查询客户",
+      "method": "POST",
+      "origin": "http://127.0.0.1:4173",
+      "path": "/api/query",
+      "source": "documented",
+      "conditions": [
+        { "source": "json", "path": "/operationName", "value": "ListCustomers" }
+      ],
+      "contentType": "application/json"
+    }
+  ]
+}

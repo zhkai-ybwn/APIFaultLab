@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>APIFaultLab 本地验收</title>
+  <script>
+    function requestOperation(operationName) {
+      return window.fetch('/api/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ operationName }),
+      }).then(async response => ({ status: response.status, body: await response.text() }))
+    }
+    function requestXhr(operationName) {
+      return new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest()
+        request.open('POST', '/api/query')
+        request.setRequestHeader('Content-Type', 'application/json')
+        request.onload = () => resolve({ status: request.status, body: request.responseText })
+        request.onerror = () => reject(new Error('网络错误'))
+        request.send(JSON.stringify({ operationName }))
+      })
+    }
+    const startup = requestOperation('StartupProbe').catch(error => ({ error: error.message }))
+    const startupXhr = requestXhr('StartupProbeXhr').catch(error => ({ error: error.message }))
+  </script>
+  <style>
+    :root { color-scheme: light dark; font: 15px/1.5 system-ui, sans-serif; }
+    body { margin: 2rem auto; padding: 0 1rem; max-width: 46rem; }
+    h1, h2, p { margin: 0 0 .625rem; }
+    h1 { font-size: 1.375rem; }
+    h2 { font-size: 1rem; }
+    section { border-top: 1px solid GrayText; margin-top: 1rem; padding-top: 1rem; }
+    .actions { display: flex; flex-wrap: wrap; gap: .5rem; }
+    button { padding: .375rem .625rem; font: inherit; cursor: pointer; }
+    pre { min-height: 1.5em; white-space: pre-wrap; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>APIFaultLab 本地验收</h1>
+  <p>在 F12 打开 APIFaultLab。前三个操作共用 <code>POST /api/query</code>，依靠 <code>operationName</code> 区分。</p>
+  <section aria-label="手动请求">
+    <h2>手动请求</h2>
+    <div class="actions">
+      <button type="button" data-operation="ListOrders">查询订单（Fetch）</button>
+      <button type="button" data-operation="ListCustomers">查询客户（Fetch）</button>
+      <button type="button" data-xhr="GetVersion">查询版本（XHR）</button>
+      <button type="button" id="tiles">发出 125 个瓦片请求</button>
+    </div>
+    <pre id="result" aria-live="polite">等待操作</pre>
+  </section>
+  <section>
+    <h2>服务器收到的 POST</h2>
+    <button type="button" id="read-counts">读取计数</button>
+    <pre id="counts" aria-live="polite">等待读取</pre>
+  </section>
+  <section>
+    <h2>本次页面启动请求</h2>
+    <pre id="startup" aria-live="polite">等待响应</pre>
+  </section>
+  <script>
+    const result = document.querySelector('#result')
+    const counts = document.querySelector('#counts')
+
+    function print(output, value) {
+      output.textContent = JSON.stringify(value, null, 2)
+    }
+
+    for (const button of document.querySelectorAll('[data-operation], [data-xhr]')) {
+      button.addEventListener('click', async () => {
+        const operation = button.dataset.operation || button.dataset.xhr
+        result.textContent = operation + ' 正在请求'
+        try {
+          const response = await (button.dataset.xhr ? requestXhr(operation) : requestOperation(operation))
+          print(result, { operation, ...response })
+        } catch (error) {
+          print(result, { operation, error: error.message })
+        }
+      })
+    }
+
+    document.querySelector('#read-counts').addEventListener('click', async () => {
+      try { print(counts, await (await fetch('/__counts')).json()) } catch (error) {
+        counts.textContent = error.message
+      }
+    })
+    document.querySelector('#tiles').addEventListener('click', async event => {
+      const button = event.currentTarget
+      button.disabled = true
+      result.textContent = '正在请求瓦片'
+      const requests = Array.from({ length: 125 }, (_, index) => fetch('/tiles/5/0/' + index + '.png'))
+      const replies = await Promise.allSettled(requests)
+      result.textContent = replies.filter(reply => reply.status === 'fulfilled' && reply.value.ok).length + ' / 125 个瓦片收到响应'
+      button.disabled = false
+    })
+    void Promise.all([startup, startupXhr]).then(([fetchResponse, xhrResponse]) =>
+      print(document.querySelector('#startup'), { Fetch: fetchResponse, XHR: xhrResponse }))
+  </script>
+</body>
+</html>

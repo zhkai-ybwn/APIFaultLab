@@ -1,0 +1,49 @@
+:root {
+  color-scheme: light dark;
+  --font-ui: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --surface: light-dark(#f7f8fa, #181a1e);
+  --surface-raised: light-dark(#ffffff, #202329);
+  --surface-recessed: light-dark(#eef0f4, #14161a);
+  --surface-hover: light-dark(#eff1f5, #252830);
+  --surface-active: light-dark(#e9edf6, #303545);
+  --text: light-dark(#191b22, #eef0f6);
+  --text-secondary: light-dark(#505662, #c1c6d2);
+  --text-muted: light-dark(#656c79, #a0a7b7);
+  --line: light-dark(#dce0e7, #30343e);
+  --line-strong: light-dark(#c6ccd7, #474d5c);
+  --control-line: light-dark(#7d8594, #677286);
+  --accent: light-dark(#285bc9, #a9beff);
+  --accent-soft: light-dark(#e9effd, #28334d);
+  --accent-fill: light-dark(#285bc9, #abc1ff);
+  --on-accent: light-dark(#ffffff, #182746);
+  --positive: light-dark(#23734e, #90d7aa);
+  --positive-soft: light-dark(#e7f2ea, #22352b);
+  --warning: light-dark(#8a5307, #efbb79);
+  --warning-soft: light-dark(#f8eddc, #392d20);
+  --danger: light-dark(#b13a39, #ff9f9b);
+  --danger-soft: light-dark(#fbeaea, #3c272a);
+  --focus: light-dark(#5479d8, #a9beff);
+  --toolbar-material: light-dark(rgba(247, 248, 250, 0.92), rgba(24, 26, 30, 0.91));
+  --shadow-floating: 0 4px 20px light-dark(rgba(29, 41, 65, 0.11), rgba(0, 0, 0, 0.32));
+  --motion-fast: 110ms;
+  --motion-ui: 170ms;
+  --motion-ease: cubic-bezier(0.2, 0.75, 0.25, 1);
+}
+
+:root[data-theme='light'] { color-scheme: light; }
+:root[data-theme='dark'] { color-scheme: dark; }
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-fast: 0ms;
+    --motion-ui: 0ms;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  :root {
+    --toolbar-material: var(--surface);
+    --line: var(--line-strong);
+  }
+}
