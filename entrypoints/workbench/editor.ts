@@ -1,4 +1,5 @@
 import type { CatalogEntry, JsonScalar, MockResponse, RequestCondition, Rule } from '../../lib/model'
+import { MAX_RULE_HITS, normalizeResponseHeaders } from '../../lib/rules'
 import { hasInvalidJson, presetResponse, validateScenarioResponse } from '../../lib/scenarios'
 
 export { applyScenario, presetResponse, presets } from '../../lib/scenarios'
@@ -12,9 +13,17 @@ interface DraftCondition {
   valueKind: 'text' | 'scalar'
 }
 
+export interface DraftHeader {
+  id: string
+  name: string
+  value: string
+}
+
 export interface RuleDraft {
   id: string
   response: MockResponse
+  headers: DraftHeader[]
+  maxHits?: number
   conditions: DraftCondition[]
   allowInvalidJson: boolean
 }
@@ -29,10 +38,37 @@ export function newCondition(source: RequestCondition['source']): DraftCondition
   return { id: crypto.randomUUID(), source, path: '', value: '', valueKind: 'text' }
 }
 
+export function newResponseHeader(name = '', value = ''): DraftHeader {
+  return { id: crypto.randomUUID(), name, value }
+}
+
+export function draftHeaders(headers?: Record<string, string>): DraftHeader[] {
+  return Object.entries(headers ?? {}).map(([name, value]) => newResponseHeader(name, value))
+}
+
+export function compileDraftHeaders(rows: DraftHeader[]): Record<string, string> | undefined {
+  const nonEmpty = rows.filter(row => row.name.trim() || row.value)
+  if (!nonEmpty.length) return undefined
+  const record: Record<string, string> = {}
+  const seen = new Set<string>()
+  for (const row of nonEmpty) {
+    const name = row.name.trim()
+    if (!name) throw new Error('请填写自定义响应头名称')
+    const lower = name.toLowerCase()
+    if (seen.has(lower)) throw new Error(`响应头 ${name} 重复，请合并为一项`)
+    seen.add(lower)
+    record[name] = row.value
+  }
+  return normalizeResponseHeaders(record)
+}
+
 export function createDraft(entry: CatalogEntry, rule?: Rule, conditions = rule?.conditions ?? []): RuleDraft {
+  const baseResponse = rule?.response ?? presetResponse('404', entry)
   return {
     id: rule?.id ?? crypto.randomUUID(),
-    response: { ...(rule?.response ?? presetResponse('404', entry)) },
+    response: { ...baseResponse, ...(baseResponse.headers ? { headers: { ...baseResponse.headers } } : {}) },
+    headers: draftHeaders(baseResponse.headers),
+    maxHits: rule?.maxHits,
     allowInvalidJson: Boolean(rule && hasInvalidJson(rule.response)),
     conditions: conditions.map(condition => ({
       id: crypto.randomUUID(), source: condition.source, path: condition.path,
@@ -101,6 +137,18 @@ export function draftRule(draft: RuleDraft, entry: CatalogEntry, routeKey: strin
     }
     return { source: condition.source, path, value }
   })
-  const response = validateScenarioResponse(draft.response, draft.allowInvalidJson, entry.endpoint.method)
-  return { id: draft.id, routeKey, endpoint: { ...entry.endpoint }, conditions, response }
+  const headers = draft.response.kind === 'http' ? compileDraftHeaders(draft.headers) : undefined
+  const response = validateScenarioResponse(
+    { ...draft.response, ...(headers ? { headers } : { headers: undefined }) },
+    draft.allowInvalidJson,
+    entry.endpoint.method,
+  )
+  const maxHits = draft.maxHits
+  if (maxHits !== undefined && (!Number.isSafeInteger(maxHits) || maxHits < 1 || maxHits > MAX_RULE_HITS)) {
+    throw new Error(`最多生效次数应为 1 到 ${MAX_RULE_HITS} 的整数`)
+  }
+  return {
+    id: draft.id, routeKey, endpoint: { ...entry.endpoint }, conditions, response,
+    ...(maxHits !== undefined ? { maxHits } : {}),
+  }
 }

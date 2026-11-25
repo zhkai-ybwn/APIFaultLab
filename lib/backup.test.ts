@@ -72,4 +72,43 @@ describe('portable local backup', () => {
     expect(readBackup(exportBackup(data))).toEqual(data)
     expect(JSON.parse(exportRescueData(raw)).data).toEqual(raw)
   })
+
+  it('round-trips, merges and salvages site route grouping while staying compatible with legacy backups', async () => {
+    const withGrouping = readLocalData({
+      plans: [plan],
+      routeGroupingBySite: { [siteOrigin]: 'ignore-query', 'https://default.test': 'exact' },
+    })
+    expect(withGrouping.routeGroupingBySite).toEqual({ [siteOrigin]: 'ignore-query' })
+    const exported = exportBackup(withGrouping)
+    expect(readBackup(exported)).toEqual(withGrouping)
+
+    const merged = await mergeBackup(readLocalData(), readBackup(exported))
+    expect(merged.data.routeGroupingBySite).toEqual({ [siteOrigin]: 'ignore-query' })
+
+    const salvaged = salvageLocalData({
+      routeGroupingBySite: { [siteOrigin]: 'ignore-query', 'ftp://bad.test': 'ignore-query', 'https://bad-mode.test': 'unknown' },
+    })
+    expect(salvaged.data.routeGroupingBySite).toEqual({ [siteOrigin]: 'ignore-query' })
+    expect(salvaged.recovered).toBe(1)
+    expect(salvaged.skipped).toBe(2)
+  })
+
+  it('round-trips header conditions, custom response headers and maxHits in backups', () => {
+    const richPlan = {
+      ...plan,
+      id: 'rich-plan',
+      rules: [{
+        ...plan.rules[0]!,
+        id: 'retry-rule',
+        maxHits: 2,
+        conditions: [{ source: 'header' as const, path: 'X-Action', value: 'ListOrders' }],
+        response: { ...response, headers: { 'X-Total-Count': '0', 'X-Trace-Id': 'mock-1' } },
+      }],
+    }
+    const data = readLocalData({
+      plans: [richPlan],
+      scenarios: [{ id: 'with-headers', name: '带响应头', response: { ...response, headers: { 'X-Mode': 'fault' } } }],
+    })
+    expect(readBackup(exportBackup(data))).toEqual(data)
+  })
 })

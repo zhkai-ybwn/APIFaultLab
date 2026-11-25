@@ -2,6 +2,7 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import type { CustomScenario } from '../../lib/model'
 import { normalizeCustomScenario, presetResponse, sameScenarioResponse, validateScenarioResponse, type ScenarioSeed } from '../../lib/scenarios'
+import { compileDraftHeaders, draftHeaders, newResponseHeader, type DraftHeader } from './editor'
 
 const props = defineProps<{
   scenarios: CustomScenario[]
@@ -11,6 +12,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{ save: [scenario: CustomScenario]; delete: [id: string]; close: [] }>()
 const draft = ref<CustomScenario | null>(null)
+const headerRows = ref<DraftHeader[]>([])
 const pending = ref<CustomScenario | null>(null)
 const deleteId = ref<string | null>(null)
 const editorName = ref<HTMLInputElement | null>(null)
@@ -22,7 +24,8 @@ const hasBody = computed(() => draft.value?.response.kind === 'http' && ![204, 2
 const preview = computed(() => {
   if (!draft.value) return null
   try {
-    return validateScenarioResponse(draft.value.response, draft.value.allowInvalidJson === true)
+    const headers = draft.value.response.kind === 'http' ? compileDraftHeaders(headerRows.value) : undefined
+    return validateScenarioResponse({ ...draft.value.response, ...(headers ? { headers } : { headers: undefined }) }, draft.value.allowInvalidJson === true)
   } catch {
     return null
   }
@@ -30,17 +33,20 @@ const preview = computed(() => {
 
 function clearDraft() {
   draft.value = null
+  headerRows.value = []
   pending.value = null
   error.value = ''
 }
 
 function openDraft(source?: CustomScenario | ScenarioSeed) {
+  const baseResponse = source?.response ?? presetResponse('500')
   draft.value = {
     id: source && 'id' in source ? source.id : crypto.randomUUID(),
     name: source && 'name' in source ? source.name : '',
-    response: { ...(source?.response ?? presetResponse('500')) },
+    response: { ...baseResponse, ...(baseResponse.headers ? { headers: { ...baseResponse.headers } } : {}) },
     allowInvalidJson: source?.allowInvalidJson ?? false,
   }
+  headerRows.value = draftHeaders(baseResponse.headers)
   pending.value = null
   deleteId.value = null
   error.value = ''
@@ -51,7 +57,11 @@ function save() {
   if (!draft.value) return
   error.value = ''
   try {
-    const scenario = normalizeCustomScenario(draft.value)
+    const headers = draft.value.response.kind === 'http' ? compileDraftHeaders(headerRows.value) : undefined
+    const scenario = normalizeCustomScenario({
+      ...draft.value,
+      response: { ...draft.value.response, ...(headers ? { headers } : { headers: undefined }) },
+    })
     pending.value = scenario
     emit('save', scenario)
   } catch (cause) {
@@ -142,6 +152,30 @@ watch(() => props.scenarios, (items) => {
           <label v-if="hasBody && draft.response.contentType.toLowerCase().includes('json')" class="check-line subtle">
             <input v-model="draft.allowInvalidJson" type="checkbox" class="check" :disabled="busy" />发送无效 JSON
           </label>
+          <div v-if="draft.response.kind === 'http'" class="editor-section">
+            <div class="condition-top">
+              <span class="field-label">自定义响应头（可选）</span>
+              <button type="button" class="button button-text" :disabled="busy || headerRows.length >= 20"
+                @click="headerRows.push(newResponseHeader())">添加响应头</button>
+            </div>
+            <div v-for="(header, index) in headerRows" :key="header.id" class="condition">
+              <div class="condition-top">
+                <span class="subtle">响应头 {{ index + 1 }}</span>
+                <button type="button" class="button button-text button-danger" :disabled="busy" :aria-label="`移除响应头 ${index + 1}`"
+                  @click="headerRows.splice(index, 1)">移除</button>
+              </div>
+              <div class="editor-grid">
+                <label class="field">
+                  <span>名称</span>
+                  <input v-model="header.name" class="input mono" placeholder="X-Total-Count" :disabled="busy" />
+                </label>
+                <label class="field">
+                  <span>值</span>
+                  <input v-model="header.value" class="input mono" placeholder="0" :disabled="busy" />
+                </label>
+              </div>
+            </div>
+          </div>
         </div>
       </details>
       <details v-if="preview" :key="`preview-${draft.id}`" class="report-details" open>
@@ -153,6 +187,7 @@ watch(() => props.scenarios, (items) => {
         <dl v-if="preview.kind === 'http'" class="plan-notes">
           <template v-if="preview.contentType"><dt>Content-Type</dt><dd class="mono">{{ preview.contentType }}</dd></template>
           <template v-if="preview.retryAfterSeconds !== undefined"><dt>Retry-After</dt><dd class="mono">{{ preview.retryAfterSeconds }}</dd></template>
+          <template v-for="(value, name) in preview.headers" :key="name"><dt class="mono">{{ name }}</dt><dd class="mono">{{ value }}</dd></template>
         </dl>
         <pre v-if="preview.body" class="response-preview mono">{{ preview.body }}</pre>
         <p v-else-if="preview.kind === 'http'" class="subtle">无响应正文</p>

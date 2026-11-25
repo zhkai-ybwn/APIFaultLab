@@ -5,6 +5,7 @@ export const PAGE_BOOT_MESSAGE = 'apifaultlab-page-boot'
 export const SAMPLE_WINDOW_MS = 20_000
 
 export type JsonScalar = string | number | boolean | null
+export type RouteGrouping = 'exact' | 'ignore-query'
 
 export interface Endpoint {
   method: string
@@ -14,7 +15,7 @@ export interface Endpoint {
 }
 
 export interface RequestCondition {
-  source: 'query' | 'json'
+  source: 'query' | 'json' | 'header'
   path: string
   value: JsonScalar
 }
@@ -33,6 +34,7 @@ export interface MockResponse {
   contentType: string
   delayMs: number
   retryAfterSeconds?: number
+  headers?: Record<string, string>
 }
 
 export type IgnoreRule =
@@ -52,6 +54,7 @@ export interface Rule {
   routeKey: string
   conditions: RequestCondition[]
   response: MockResponse
+  maxHits?: number
 }
 
 export interface SavedPlan {
@@ -148,11 +151,13 @@ export interface PanelSnapshot {
   plans: SavedPlan[]
   ignores: IgnoreRule[]
   scenarios: CustomScenario[]
+  routeGrouping?: RouteGrouping
 }
 
 export type PanelCommand =
   | { type: 'bind'; tabId: number }
   | { type: 'set-observing'; target: PanelTarget; enabled: boolean }
+  | { type: 'set-route-grouping'; target: PanelTarget; mode: RouteGrouping }
   | { type: 'reconnect'; target: PanelTarget }
   | { type: 'apply'; target: PanelTarget; rules: Rule[] }
   | { type: 'stop'; target: PanelTarget }
@@ -191,7 +196,7 @@ export type PanelMessage =
 
 export type PageCommand =
   | { type: 'status' }
-  | { type: 'configure'; session: string; siteOrigin: string; revision: number; observing: boolean; rules: Rule[]; overrideStartup?: boolean }
+  | { type: 'configure'; session: string; siteOrigin: string; revision: number; observing: boolean; rules: Rule[]; overrideStartup?: boolean; routeGrouping?: RouteGrouping }
   | { type: 'observe'; session: string; enabled: boolean }
   | { type: 'sample'; session: string; id: string; endpoint: Endpoint; routeKey: string; expiresAt: number }
   | { type: 'stop'; session: string; revision: number }
@@ -202,6 +207,7 @@ export interface PageStatus {
   activeCount: number
   observing: boolean
   intact: boolean
+  routeGrouping?: RouteGrouping
   startupArmed?: boolean
   startupState?: 'waiting' | 'protected' | 'blocked'
   sampleId?: string

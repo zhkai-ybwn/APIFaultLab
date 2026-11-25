@@ -20,6 +20,7 @@ import {
   type PanelTarget,
   type RequestEvent,
   type ResponseSampleState,
+  type RouteGrouping,
   type Rule,
   type RuleOutcome,
   type SavedPlan,
@@ -31,7 +32,7 @@ import { changeImportedDirectory } from '../lib/catalog-storage'
 import type { LocalDataCommand, LocalDataRequest, LocalDataResponse } from '../lib/local-data-client'
 import { createRequestUpdate, entryResponseSources, hasSamePanelTarget } from '../lib/panel-request-update'
 import { classifyEndpoint, ignoreKey, matchesIgnore, normalizeIgnoreRule } from '../lib/request-filters'
-import { endpointCovers, endpointKey, routeKey, validateRuleSet } from '../lib/rules'
+import { endpointCovers, endpointKey, isValidHttpMethod, routeKey, validateRuleSet } from '../lib/rules'
 import { normalizeCustomScenario } from '../lib/scenarios'
 
 const LOCAL_KEY = 'apiFaultLabLocal_v1'
@@ -122,7 +123,7 @@ function post(view: PanelView, message: PanelMessage): boolean {
   }
 }
 
-async function getDocument(tabId: number): Promise<DocumentTarget | null> {
+async function getDocument(tabId: number, groupingFor: (origin: string) => RouteGrouping = () => 'exact'): Promise<DocumentTarget | null> {
   const [tab, frame] = await Promise.all([
     chrome.tabs.get(tabId),
     // webNavigation can report the inspected page before the extension has scripting access.
@@ -131,27 +132,33 @@ async function getDocument(tabId: number): Promise<DocumentTarget | null> {
   if (tab.incognito) return null
   if (!frame?.documentId) throw new Error('主页面正在切换。')
   if (!/^https?:\/\//i.test(frame.url)) return null
-  const currentRoute = routeKey(frame.url)
+  const siteOrigin = new URL(frame.url).origin
+  const pageUrl = routeKey(frame.url)
+  const currentRoute = routeKey(frame.url, groupingFor(siteOrigin))
   return {
     tabId,
     documentId: frame.documentId,
-    pageUrl: currentRoute,
+    pageUrl,
     routeKey: currentRoute,
-    siteOrigin: new URL(frame.url).origin,
+    siteOrigin,
   }
 }
 
 async function runControl(
-  target: DocumentTarget, command: PageCommand, expectedRoute?: string,
+  target: DocumentTarget, command: PageCommand, expectedRoute?: string, routeGrouping: RouteGrouping = 'exact',
 ): Promise<PageStatus | null> {
   const [execution] = await chrome.scripting.executeScript({
     target: { tabId: target.tabId, documentIds: [target.documentId] },
     world: 'MAIN',
     injectImmediately: true,
-    args: [PAGE_CONTROL_KEY, command, expectedRoute ?? null],
-    func: (key: string, message: PageCommand, expectedUrl: string | null) => {
+    args: [PAGE_CONTROL_KEY, command, expectedRoute ?? null, routeGrouping === 'ignore-query'],
+    func: (key: string, message: PageCommand, expectedUrl: string | null, ignoreQuery: boolean) => {
       const here = new URL(location.href)
-      if (expectedUrl !== null && `${here.origin}${here.pathname}${here.search}${here.hash}` !== expectedUrl) return null
+      const hash = ignoreQuery && here.hash.includes('?') ? here.hash.slice(0, here.hash.indexOf('?')) : here.hash
+      const current = ignoreQuery
+        ? `${here.origin}${here.pathname}${hash === '#' ? '' : hash}`
+        : `${here.origin}${here.pathname}${here.search}${here.hash}`
+      if (expectedUrl !== null && current !== expectedUrl) return null
       const control = (window as unknown as Record<string, unknown>)[key]
       if (typeof control !== 'function') return null
       return (control as PageControl)(message)
@@ -181,7 +188,7 @@ function eventFromPage(report: WorkerReport, session: TabSession): RequestEvent 
       typeof event.routeKey !== 'string' || event.routeKey.length > 4000 ||
       typeof event.requestId !== 'string' || event.requestId.length > 120 ||
       !Number.isSafeInteger(event.revision) || event.revision < 0 || event.revision > session.revision ||
-      !Number.isFinite(event.time) || typeof endpoint.method !== 'string' || !/^[A-Z]{1,24}$/.test(endpoint.method) ||
+      !Number.isFinite(event.time) || !isValidHttpMethod(endpoint.method) ||
       typeof endpoint.origin !== 'string' || endpoint.origin.length > 500 ||
       typeof endpoint.path !== 'string' || !endpoint.path.startsWith('/') || endpoint.path.length > 2000 ||
       /[?#\\]/.test(endpoint.path)) {
@@ -437,10 +444,15 @@ export default defineBackground(() => {
     return queued
   }
 
+  function routeGroupingFor(origin: string): RouteGrouping {
+    return localData.routeGroupingBySite?.[origin] ?? 'exact'
+  }
+
   async function cacheSession(session: TabSession) {
-    const { tabId, documentId, pageUrl, siteOrigin, id, revision, rules, status, observing, activeCount, earlyAccess } = session
+    const { tabId, documentId, pageUrl, routeKey: sessionRoute, siteOrigin, id, revision, rules, status, observing, activeCount, earlyAccess } = session
     const safeUrl = canPersistRoute(pageUrl) ? pageUrl : `${siteOrigin}/`
-    const state: CachedTabState = { tabId, documentId, pageUrl: safeUrl, routeKey: safeUrl, siteOrigin, id, revision, rules, status, observing, activeCount, earlyAccess }
+    const safeRoute = canPersistRoute(sessionRoute) ? sessionRoute : safeUrl
+    const state: CachedTabState = { tabId, documentId, pageUrl: safeUrl, routeKey: safeRoute, siteOrigin, id, revision, rules, status, observing, activeCount, earlyAccess }
     try {
       await sessionCache.save(state)
       session.sessionWarning = undefined
@@ -540,6 +552,7 @@ export default defineBackground(() => {
         .map(({ entry }) => ({ ...entry, example: undefined })),
       ignores: localData.ignoresBySite[session.siteOrigin] ?? [],
       scenarios: localData.scenarios,
+      routeGrouping: routeGroupingFor(session.siteOrigin),
     }
     const responseSources = entryResponseSources(snapshot.entries)
     for (const view of panels.values()) {
@@ -647,6 +660,7 @@ export default defineBackground(() => {
       session.startupState = current.startupState
     }
     if (!current?.intact) throw new Error('页面接入未就绪，请重新连接或刷新被测页面。')
+    const grouping = routeGroupingFor(session.siteOrigin)
     if (!current.session || (current.session !== session.id && current.activeCount === 0)) {
       if (session.rules.length && session.status !== 'restoring') {
         session.status = 'restoring'
@@ -655,10 +669,17 @@ export default defineBackground(() => {
       }
       current = requireAck(await runControl(session, {
         type: 'configure', session: session.id, siteOrigin: session.siteOrigin,
-        revision: session.revision, observing: session.observing, rules: session.rules,
+        revision: session.revision, observing: session.observing, rules: session.rules, routeGrouping: grouping,
       }), session.id, session.revision, session.rules.length)
     } else if (current.session === session.id && current.revision === session.revision && current.activeCount === session.rules.length) {
-      if (current.observing !== session.observing) {
+      if ((current.routeGrouping ?? 'exact') !== grouping) {
+        const nextRevision = session.revision + 1
+        current = requireAck(await runControl(session, {
+          type: 'configure', session: session.id, siteOrigin: session.siteOrigin,
+          revision: nextRevision, observing: session.observing, rules: session.rules, routeGrouping: grouping,
+        }), session.id, nextRevision, session.rules.length)
+        session.revision = nextRevision
+      } else if (current.observing !== session.observing) {
         current = requireAck(await runControl(session, { type: 'observe', session: session.id, enabled: session.observing }),
           session.id, session.revision, session.rules.length)
       }
@@ -733,7 +754,7 @@ export default defineBackground(() => {
       }
       // A frame lookup can briefly fail while Chrome is replacing the main document.
       // Leave the last usable snapshot in place until a later navigation event can refresh it.
-      const target = await getDocument(tabId).catch(() => undefined)
+      const target = await getDocument(tabId, routeGroupingFor).catch(() => undefined)
       if (target === undefined) {
         const retrying = scheduleDocumentRetry(tabId, options.boot)
         if (session) {
@@ -824,10 +845,11 @@ export default defineBackground(() => {
     session.status = 'applying'
     publishSession(session)
     try {
+      const grouping = routeGroupingFor(session.siteOrigin)
       const status = requireAck(await runControl(session, {
         type: 'configure', session: session.id, siteOrigin: session.siteOrigin, revision, observing: session.observing, rules,
-        overrideStartup: true,
-      }, session.routeKey), session.id, revision, rules.length)
+        overrideStartup: true, routeGrouping: grouping,
+      }, session.routeKey, grouping), session.id, revision, rules.length)
       session.startupArmed = status.startupArmed
       session.startupState = status.startupState
     } catch (reason) {
@@ -939,9 +961,10 @@ export default defineBackground(() => {
     const attempt: SampleAttempt = { id: crypto.randomUUID(), routeKey, endpoint, expiresAt: Date.now() + SAMPLE_WINDOW_MS }
     clearSample(session)
     try {
+      const grouping = routeGroupingFor(session.siteOrigin)
       const status = requireAck(await runControl(session, {
         type: 'sample', session: session.id, id: attempt.id, endpoint, routeKey, expiresAt: attempt.expiresAt,
-      }, routeKey), session.id, session.revision, session.activeCount)
+      }, routeKey, grouping), session.id, session.revision, session.activeCount)
       if (status.sampleId !== attempt.id) throw new Error('页面未确认采样，请检查页面连接后重试。')
     } catch (error) {
       clearSample(session, { endpoint, state: 'failed', message: errorMessage(error) })
@@ -1032,6 +1055,61 @@ export default defineBackground(() => {
     publishOtherPreferenceViews(session, false)
   }
 
+  async function setRouteGrouping(session: TabSession, mode: RouteGrouping): Promise<void> {
+    if (mode !== 'exact' && mode !== 'ignore-query') throw new Error('页面归组方式无效。')
+    await updateLocal(data => {
+      const next = { ...data.routeGroupingBySite }
+      if (mode === 'ignore-query') next[session.siteOrigin] = mode
+      else delete next[session.siteOrigin]
+      const { routeGroupingBySite: _prev, ...rest } = data
+      return Object.keys(next).length ? { ...rest, routeGroupingBySite: next } : rest
+    })
+    const previousRoute = session.routeKey
+    const nextRoute = routeKey(session.pageUrl, mode)
+    if (nextRoute !== previousRoute) {
+      const existing = session.catalog.get(previousRoute)
+      if (existing?.size) {
+        const targetGroup = session.catalog.get(nextRoute) ?? new Map<string, CatalogEntry>()
+        for (const [key, entry] of existing) {
+          if (!targetGroup.has(key) && targetGroup.size < MAX_ENTRIES) targetGroup.set(key, { ...entry })
+        }
+        session.catalog.delete(nextRoute)
+        session.catalog.set(nextRoute, targetGroup)
+      }
+      session.routeKey = nextRoute
+      clearSample(session)
+      session.recoveryFocus = undefined
+      session.recoveryState = undefined
+      session.recoveryScope = undefined
+    }
+    if (['observing', 'active'].includes(session.status)) {
+      const revision = session.revision + 1
+      await invalidateSession(session)
+      try {
+        const status = requireAck(await runControl(session, {
+          type: 'configure', session: session.id, siteOrigin: session.siteOrigin, revision,
+          observing: session.observing, rules: session.rules, routeGrouping: mode,
+        }), session.id, revision, session.rules.length)
+        session.revision = revision
+        session.startupArmed = status.startupArmed
+        session.startupState = status.startupState
+      } catch (reason) {
+        session.status = 'uncertain'
+        session.message = errorMessage(reason)
+        if (session.rules.length) session.sessionWarning = SESSION_CACHE_WARNING
+        badge(session)
+        throw reason
+      }
+      await cacheSession(session)
+    }
+    scheduleCache()
+    for (const [otherTabId, other] of sessions) {
+      if (otherTabId !== session.tabId && other.siteOrigin === session.siteOrigin) {
+        void refreshTab(otherTabId, { force: true }).catch(() => {})
+      }
+    }
+  }
+
   async function handle(view: PanelView, command: PanelCommand): Promise<void> {
     if (command.type === 'bind') {
       if (view.tabId !== undefined || !Number.isSafeInteger(command.tabId) || command.tabId < 0) {
@@ -1054,7 +1132,7 @@ export default defineBackground(() => {
     }
     await restored
     await enqueue(command.target.tabId, async () => {
-      const current = await getDocument(command.target.tabId).catch(() => null)
+      const current = await getDocument(command.target.tabId, routeGroupingFor).catch(() => null)
       const session = sessions.get(command.target.tabId)
       const target: PanelTarget = command.target
       const tabWide = command.type === 'stop' && current && session?.siteOrigin === current.siteOrigin &&
@@ -1082,6 +1160,9 @@ export default defineBackground(() => {
             break
           case 'set-observing':
             await setObserving(session, command.enabled)
+            break
+          case 'set-route-grouping':
+            await setRouteGrouping(session, command.mode)
             break
           case 'sample':
             await startSample(session, command.endpoint)

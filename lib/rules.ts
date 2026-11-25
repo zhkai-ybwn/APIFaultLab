@@ -1,12 +1,48 @@
-import type { Endpoint, JsonScalar, MockResponse, RequestCondition, Rule } from './model'
+import type { Endpoint, JsonScalar, MockResponse, RequestCondition, RouteGrouping, Rule } from './model'
 
 export const MAX_RESPONSE_BYTES = 512 * 1024
+export const MAX_RULE_HITS = 1000
 const MAX_CONDITION_BYTES = 256 * 1024
+const MAX_CUSTOM_HEADERS = 20
 const MAX_RULES = 200
 const MAX_RULE_SET_BYTES = 4 * 1024 * 1024
 const PATH_VARIABLE = /\{[^{}\/]+\}/g
-const METHOD = /^[!#$%&'*+.^_`|~\dA-Z-]+$/
+export const HTTP_METHOD_PATTERN = /^[!#$%&'*+.^_`|~\dA-Z-]+$/
+const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
 const JSON_MEDIA = /(?:^|[+/])json(?:\s*;|$)/i
+
+export function isValidHttpMethod(method: unknown): method is string {
+  return typeof method === 'string' && method.length > 0 && method.length <= 32 && HTTP_METHOD_PATTERN.test(method)
+}
+
+export function normalizeResponseHeaders(input?: Record<string, string>): Record<string, string> | undefined {
+  if (input === undefined) return undefined
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    throw new Error('自定义响应头格式无效')
+  }
+  const entries = Object.entries(input)
+  if (entries.length > MAX_CUSTOM_HEADERS) {
+    throw new Error(`最多可设置 ${MAX_CUSTOM_HEADERS} 个自定义响应头`)
+  }
+  const seen = new Set<string>()
+  const normalized: Record<string, string> = {}
+  for (const [rawName, value] of entries) {
+    const name = rawName.trim()
+    if (!name || name.length > 128 || !HEADER_NAME_PATTERN.test(name)) {
+      throw new Error(`响应头名称无效：${rawName || '（空）'}`)
+    }
+    const lower = name.toLowerCase()
+    if (seen.has(lower)) {
+      throw new Error(`响应头 ${name} 重复，请合并为一项`)
+    }
+    if (typeof value !== 'string' || value.length > 1024 || /[\r\n\0]/.test(value)) {
+      throw new Error(`响应头 ${name} 的值无效`)
+    }
+    seen.add(lower)
+    normalized[name] = value
+  }
+  return seen.size ? normalized : undefined
+}
 const STATUS_TEXT: Record<number, string> = {
   200: 'OK', 204: 'No Content', 205: 'Reset Content', 400: 'Bad Request',
   401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 429: 'Too Many Requests',
@@ -21,8 +57,12 @@ function httpUrl(input: string): URL {
   return url
 }
 
-export function routeKey(input: string): string {
+export function routeKey(input: string, grouping: RouteGrouping = 'exact'): string {
   const url = httpUrl(input)
+  if (grouping === 'ignore-query') {
+    const hash = url.hash.includes('?') ? url.hash.slice(0, url.hash.indexOf('?')) : url.hash
+    return `${url.origin}${url.pathname}${hash === '#' ? '' : hash}`
+  }
   return `${url.origin}${url.pathname}${url.search}${url.hash}`
 }
 
@@ -50,6 +90,17 @@ export function endpointCovers(expected: Endpoint, actual: Endpoint): boolean {
   return expected.method === actual.method && expected.origin === actual.origin && matchesPath(expected, actual.path)
 }
 
+function templateSegmentsOverlap(left: string, right: string): boolean {
+  const leftTokens = left.split(/(\{[^{}\/]+\})/)
+  const rightTokens = right.split(/(\{[^{}\/]+\})/)
+  const leftPrefix = leftTokens[0] ?? ''
+  const rightPrefix = rightTokens[0] ?? ''
+  if (!leftPrefix.startsWith(rightPrefix) && !rightPrefix.startsWith(leftPrefix)) return false
+  const leftSuffix = leftTokens.at(-1) ?? ''
+  const rightSuffix = rightTokens.at(-1) ?? ''
+  return leftSuffix.endsWith(rightSuffix) || rightSuffix.endsWith(leftSuffix)
+}
+
 function endpointsOverlap(left: Endpoint, right: Endpoint): boolean {
   if (left.method !== right.method || left.origin !== right.origin) return false
   if (!left.template) return matchesPath(right, left.path)
@@ -63,7 +114,7 @@ function endpointsOverlap(left: Endpoint, right: Endpoint): boolean {
     if (other === undefined) return false
     if (!part.includes('{')) return matchesPath({ ...right, path: other }, part)
     if (!other.includes('{')) return matchesPath({ ...left, path: part }, other)
-    return true
+    return templateSegmentsOverlap(part, other)
   })
 }
 
@@ -74,8 +125,9 @@ function pointerParts(pointer: string): string[] {
 }
 
 function conditionKey(condition: RequestCondition): string {
-  const field = condition.source === 'query' ? condition.path : JSON.stringify(pointerParts(condition.path))
-  return `${condition.source}:${field}`
+  if (condition.source === 'query') return `query:${condition.path}`
+  if (condition.source === 'header') return `header:${condition.path.trim().toLowerCase()}`
+  return `json:${JSON.stringify(pointerParts(condition.path))}`
 }
 
 function jsonScalar(value: unknown): value is JsonScalar {
@@ -88,9 +140,12 @@ export function validateRequestConditions(conditions: RequestCondition[]): void 
   const fields = new Set<string>()
   for (const condition of conditions) {
     if (!condition.path || condition.path.length > 512 || !jsonScalar(condition.value) ||
-        (condition.source !== 'query' && condition.source !== 'json') ||
-        (condition.source === 'query' && typeof condition.value !== 'string')) {
-      throw new Error('请检查查询参数或 JSON 字段条件')
+        (condition.source !== 'query' && condition.source !== 'json' && condition.source !== 'header') ||
+        ((condition.source === 'query' || condition.source === 'header') && typeof condition.value !== 'string')) {
+      throw new Error('请检查查询参数、请求头或 JSON 字段条件')
+    }
+    if (condition.source === 'header' && (condition.path.length > 128 || !HEADER_NAME_PATTERN.test(condition.path))) {
+      throw new Error('请求头名称格式不正确')
     }
     const key = conditionKey(condition)
     if (fields.has(key)) throw new Error('同一字段只能配置一个条件')
@@ -109,12 +164,15 @@ export function validateRuleSet(rules: Rule[]): void {
     if (!rule.id || identifiers.has(rule.id)) throw new Error('规则标识重复或缺失')
     identifiers.add(rule.id)
     if (routeKey(rule.routeKey) !== rule.routeKey) throw new Error('页面地址不完整')
-    if (!METHOD.test(endpoint.method) || httpUrl(endpoint.origin).origin !== endpoint.origin ||
+    if (!isValidHttpMethod(endpoint.method) || httpUrl(endpoint.origin).origin !== endpoint.origin ||
         !endpoint.path.startsWith('/') || /[?#\\]/.test(endpoint.path) ||
         endpoint.path.length > 4096) {
       throw new Error('接口地址或请求方法无效')
     }
     if (endpoint.template && !endpoint.path.match(PATH_VARIABLE)) throw new Error('路径模板缺少有效的参数')
+    if (rule.maxHits !== undefined && (!Number.isSafeInteger(rule.maxHits) || rule.maxHits < 1 || rule.maxHits > MAX_RULE_HITS)) {
+      throw new Error(`最多生效次数应为 1 到 ${MAX_RULE_HITS} 的整数`)
+    }
     validateRequestConditions(rule.conditions)
     buildResponse(rule.response, endpoint.method)
     bytes += encoder.encode(JSON.stringify(rule)).byteLength
@@ -200,9 +258,14 @@ export async function matchRequest(
 
   const query = new URL(request.url).searchParams
   const selected = candidates.filter((rule) => rule.conditions.every((condition) => {
-    if (condition.source !== 'query') return true
-    const values = query.getAll(condition.path)
-    return values.length === 1 && values[0] === condition.value
+    if (condition.source === 'query') {
+      const values = query.getAll(condition.path)
+      return values.length === 1 && values[0] === condition.value
+    }
+    if (condition.source === 'header') {
+      return request.headers.get(condition.path) === condition.value
+    }
+    return true
   }))
   if (selected.length === 0) return { kind: 'none', candidate: true }
 
@@ -248,6 +311,7 @@ export function buildResponse(response: MockResponse, method: string): Response 
   if (typeof contentType !== 'string' || /[\r\n]/.test(contentType) || contentType.length > 256) {
     throw new Error('响应媒体类型无效')
   }
+  const customHeaders = normalizeResponseHeaders(response.headers)
   const hasBody = method !== 'HEAD' && status !== 204 && status !== 205
   const headers = new Headers({ 'Cache-Control': 'no-store' })
   if (status !== 204 && status !== 205 && contentType) headers.set('Content-Type', contentType)
@@ -257,6 +321,7 @@ export function buildResponse(response: MockResponse, method: string): Response 
     }
     headers.set('Retry-After', String(response.retryAfterSeconds))
   }
+  for (const [name, value] of Object.entries(customHeaders ?? {})) headers.set(name, value)
   return new Response(hasBody ? body : null, { status, statusText: STATUS_TEXT[status], headers })
 }
 

@@ -1,5 +1,5 @@
 import type { CatalogEntry, CustomScenario, MockResponse } from './model'
-import { buildResponse } from './rules'
+import { buildResponse, normalizeResponseHeaders } from './rules'
 
 const json = 'application/json'
 
@@ -92,13 +92,20 @@ export function scenarioKey(choice: ScenarioChoice): string {
 
 export function applyScenario(choice: ScenarioChoice, entry: CatalogEntry): ScenarioSeed {
   if (choice.kind === 'builtin') return { response: presetResponse(choice.preset, entry), allowInvalidJson: false }
-  return { response: { ...choice.scenario.response }, allowInvalidJson: choice.scenario.allowInvalidJson === true }
+  const headers = choice.scenario.response.headers ? { ...choice.scenario.response.headers } : undefined
+  return { response: { ...choice.scenario.response, ...(headers ? { headers } : {}) }, allowInvalidJson: choice.scenario.allowInvalidJson === true }
+}
+
+function headerSignature(headers?: Record<string, string>): string {
+  if (!headers) return ''
+  return JSON.stringify(Object.entries(headers).sort(([a], [b]) => a.localeCompare(b)))
 }
 
 export function sameScenarioResponse(left: MockResponse, right: MockResponse): boolean {
   if (left.kind !== right.kind || left.delayMs !== right.delayMs) return false
   return left.kind === 'network' || (left.status === right.status && left.body === right.body &&
-    left.contentType === right.contentType && left.retryAfterSeconds === right.retryAfterSeconds)
+    left.contentType === right.contentType && left.retryAfterSeconds === right.retryAfterSeconds &&
+    headerSignature(left.headers) === headerSignature(right.headers))
 }
 
 export function hasInvalidJson(response: MockResponse): boolean {
@@ -119,9 +126,15 @@ export function validateScenarioResponse(response: MockResponse, allowInvalidJso
     configured.body = ''
     configured.contentType = ''
     delete configured.retryAfterSeconds
-  } else if (method === 'HEAD' || configured.status === 204 || configured.status === 205) {
-    configured.body = ''
-    if (configured.status === 204 || configured.status === 205) configured.contentType = ''
+    delete configured.headers
+  } else {
+    if (method === 'HEAD' || configured.status === 204 || configured.status === 205) {
+      configured.body = ''
+      if (configured.status === 204 || configured.status === 205) configured.contentType = ''
+    }
+    const headers = normalizeResponseHeaders(configured.headers)
+    if (headers) configured.headers = headers
+    else delete configured.headers
   }
   buildResponse(configured, method)
   if (!allowInvalidJson && hasInvalidJson(configured)) {

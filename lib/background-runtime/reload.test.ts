@@ -47,6 +47,7 @@ function createRuntime(localSeed: Record<string, unknown> = {}, failFirstLocalRe
   const runtimeId = 'test-extension'
   const getURL = (path: string) => `chrome-extension://${runtimeId}/${path}`
   const onCommitted = signal<[{ tabId: number; frameId: number; documentId: string; url: string }]>()
+  const onHistoryStateUpdated = signal<[{ tabId: number; frameId: number }]>()
   const onUpdated = signal<[number, { status: 'complete' }]>()
   const onPageReport = signal<[
     WorkerReport | LocalDataRequest,
@@ -80,7 +81,7 @@ function createRuntime(localSeed: Record<string, unknown> = {}, failFirstLocalRe
         if (page?.frameLookup === 'pending') return null
         return page
       },
-      onCommitted, onHistoryStateUpdated: signal(), onReferenceFragmentUpdated: signal(),
+      onCommitted, onHistoryStateUpdated, onReferenceFragmentUpdated: signal(),
     },
     runtime: { id: runtimeId, getURL, onConnect, onMessage: onPageReport },
     action: { setBadgeText: async () => {} },
@@ -99,7 +100,7 @@ function createRuntime(localSeed: Record<string, unknown> = {}, failFirstLocalRe
           await page.beforeConfigure
           page.rules = command.rules
           page.status = { ...page.status, session: command.session, revision: command.revision,
-            observing: command.observing, activeCount: command.rules.length }
+            observing: command.observing, activeCount: command.rules.length, routeGrouping: command.routeGrouping }
         }
         if (page.installed && command?.type === 'stop') {
           if (page.failStop) throw new Error('page went away')
@@ -153,13 +154,20 @@ function createRuntime(localSeed: Record<string, unknown> = {}, failFirstLocalRe
   }
 
   function reportReal(tabId: number, endpoint = rule.endpoint, phase: RequestPhase = 'real',
-    details: { ruleId?: string; requestId?: string; status?: number; sample?: string; sampleId?: string; detail?: string } = {}) {
+    details: { ruleId?: string; requestId?: string; status?: number; sample?: string; sampleId?: string; detail?: string; routeKey?: string } = {}) {
     const page = pages.get(tabId)
     if (!page || !page.status.session) throw new Error('No live page session')
     onPageReport.emit({ type: 'page-report', session: page.status.session, event: {
-      routeKey: page.url, endpoint, phase, time: Date.now(), revision: page.status.revision,
+      routeKey: details.routeKey ?? page.url, endpoint, phase, time: Date.now(), revision: page.status.revision,
       ...details, requestId: details.requestId ?? 'one-request', status: details.status ?? 200,
     } }, { id: runtimeId, tab: { id: tabId }, frameId: 0, documentId: page.documentId })
+  }
+
+  function pushHistory(tabId: number, url: string) {
+    const page = pages.get(tabId)
+    if (!page) throw new Error('No tab')
+    page.url = url
+    onHistoryStateUpdated.emit({ tabId, frameId: 0 })
   }
 
   function localCommand(command: LocalDataCommand) {
@@ -168,7 +176,7 @@ function createRuntime(localSeed: Record<string, unknown> = {}, failFirstLocalRe
     })
   }
 
-  return { view, pages, navigate, reportReal, configureAttempts, localStorage, sessionStorage, localCommand, complete: (tabId: number) => onUpdated.emit(tabId, { status: 'complete' }) }
+  return { view, pages, navigate, pushHistory, reportReal, configureAttempts, localStorage, sessionStorage, localCommand, complete: (tabId: number) => onUpdated.emit(tabId, { status: 'complete' }) }
 }
 
 afterEach(async () => {
@@ -760,5 +768,46 @@ describe('toolbar and DevTools tab sessions', () => {
     expect(await source.call({ type: 'delete-scenario', target: freshTarget, id: scenario.id })).toMatchObject({ ok: true })
     expect(peer.snapshots().at(-1)).toMatchObject({ ignores: [], scenarios: [] })
     expect((await runtime.localStorage.get(localKey))[localKey]).toMatchObject({ plans: [legacyPlan], imports, ignoresBySite: {}, scenarios: [] })
+  })
+
+  it('persists site-level ignore-query route grouping, keeps entries/rules across SPA pagination, and accepts token HTTP methods', async () => {
+    const runtime = createRuntime()
+    runtime.pages.set(1, newPage('first', `${appUrl}?page=1`))
+    runtime.pages.set(2, newPage('another-tab', `${appUrl}?page=5`))
+    const source = runtime.view('workbench.html')
+    const peer = runtime.view('workbench.html')
+    await source.call({ type: 'bind', tabId: 1 })
+    await peer.call({ type: 'bind', tabId: 2 })
+    expect(source.snapshots().at(-1)).toMatchObject({
+      pageUrl: `${appUrl}?page=1`, routeGrouping: 'exact', target: expect.objectContaining({ routeKey: `${appUrl}?page=1` }),
+    })
+
+    const customMethodEndpoint: Endpoint = { method: 'M-SEARCH', origin: 'http://localhost:5173', path: '/api/discover' }
+    runtime.reportReal(1, customMethodEndpoint)
+    await vi.waitFor(() => expect(source.snapshots().at(-1)?.entries.map(item => item.endpoint)).toContainEqual(customMethodEndpoint))
+
+    await expect(source.call({ type: 'set-route-grouping', target: source.snapshots().at(-1)!.target!, mode: 'ignore-query' }))
+      .resolves.toMatchObject({ ok: true })
+    expect(source.snapshots().at(-1)).toMatchObject({
+      pageUrl: `${appUrl}?page=1`,
+      routeGrouping: 'ignore-query',
+      target: expect.objectContaining({ routeKey: appUrl }),
+    })
+    expect(source.snapshots().at(-1)?.entries.map(item => item.endpoint)).toContainEqual(customMethodEndpoint)
+    expect(runtime.pages.get(1)?.status.routeGrouping).toBe('ignore-query')
+    await vi.waitFor(() => expect(peer.snapshots().at(-1)).toMatchObject({
+      routeGrouping: 'ignore-query',
+      target: expect.objectContaining({ routeKey: appUrl }),
+    }))
+
+    await expect(source.call({ type: 'apply', target: source.snapshots().at(-1)!.target!, rules: [rule] }))
+      .resolves.toMatchObject({ ok: true })
+    runtime.pushHistory(1, `${appUrl}?page=2&sort=asc`)
+    await vi.waitFor(() => expect(source.snapshots().at(-1)?.pageUrl).toBe(`${appUrl}?page=2&sort=asc`))
+    expect(source.snapshots().at(-1)).toMatchObject({
+      target: expect.objectContaining({ routeKey: appUrl }),
+      rules: [rule],
+      activeCount: 1,
+    })
   })
 })

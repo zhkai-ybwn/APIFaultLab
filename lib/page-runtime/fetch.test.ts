@@ -254,4 +254,81 @@ describe('page Fetch adapter in Node', () => {
     expect(new XMLHttpRequest()).toBeInstanceOf(siteXhr)
     expect(postMessage.mock.calls.map(([report]) => report.event.phase)).toEqual(['request', 'mock', 'request', 'bypassed', 'real'])
   })
+
+  it('matches rules across query parameter changes when ignore-query route grouping is enabled', async () => {
+    const applied = ++revision
+    expect(runtime[PAGE_CONTROL_KEY]?.({
+      type: 'configure',
+      session: 'this-test',
+      siteOrigin,
+      revision: applied,
+      observing: true,
+      routeGrouping: 'ignore-query',
+      rules: [{
+        id: 'list-orders',
+        routeKey: orders,
+        endpoint,
+        conditions: [{ source: 'json', path: '/operationName', value: 'ListOrders' }],
+        response: { kind: 'http', status: 200, contentType: 'application/json', body: '{"data":{"list":[]}}', delayMs: 0 },
+      }],
+    })).toMatchObject({ activeCount: 1, intact: true, routeGrouping: 'ignore-query' })
+
+    setRoute(`${orders}?page=2&sort=desc`)
+    expect(await (await query('ListOrders')).json()).toEqual({ data: { list: [] } })
+    expect(realFetch).not.toHaveBeenCalled()
+    expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({
+      event: expect.objectContaining({ phase: 'mock', routeKey: orders, revision: applied }),
+    }), siteOrigin)
+  })
+
+  it('enforces maxHits with custom response headers and header conditions, then forwards subsequent retries to real fetch', async () => {
+    const applied = ++revision
+    expect(runtime[PAGE_CONTROL_KEY]?.({
+      type: 'configure',
+      session: 'this-test',
+      siteOrigin,
+      revision: applied,
+      observing: true,
+      rules: [{
+        id: 'retry-503',
+        routeKey: orders,
+        endpoint,
+        maxHits: 2,
+        conditions: [{ source: 'header', path: 'X-Action', value: 'ListOrders' }],
+        response: {
+          kind: 'http',
+          status: 503,
+          contentType: 'application/json',
+          body: '{"message":"Service Unavailable"}',
+          delayMs: 0,
+          headers: { 'X-Fault-Source': 'apifaultlab' },
+        },
+      }],
+    })).toMatchObject({ activeCount: 1, intact: true })
+
+    const send = (action: string) => fetch(`${siteOrigin}/api/query`, {
+      method: 'POST',
+      headers: { 'X-Action': action },
+      body: 'plain-text',
+    })
+
+    const first = await send('ListOrders')
+    expect(first.status).toBe(503)
+    expect(first.headers.get('X-Fault-Source')).toBe('apifaultlab')
+
+    const unmatched = await send('ListCustomers')
+    expect(unmatched.status).toBe(200)
+    expect(realFetch).toHaveBeenCalledTimes(1)
+
+    const second = await send('ListOrders')
+    expect(second.status).toBe(503)
+
+    const third = await send('ListOrders')
+    expect(third.status).toBe(200)
+    expect(await third.json()).toEqual({ data: { list: ['actual item'] } })
+    expect(realFetch).toHaveBeenCalledTimes(2)
+    expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({
+      event: expect.objectContaining({ phase: 'bypassed', detail: expect.stringContaining('2 次生效上限') }),
+    }), siteOrigin)
+  })
 })

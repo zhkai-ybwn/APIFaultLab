@@ -1,5 +1,6 @@
 import { PAGE_BOOT_MESSAGE, PAGE_REPORT_MARKER } from '../lib/model'
 import { readStartupMarker } from '../lib/page-runtime/startup-gate'
+import { isValidHttpMethod } from '../lib/rules'
 import type { Endpoint, PageReport, RequestEvent, RequestPhase, WorkerReport } from '../lib/model'
 
 const BRIDGE_KEY = '__apiFaultLabBridge_v1__'
@@ -25,7 +26,7 @@ function readEndpoint(value: unknown): Endpoint | null {
   if (!endpoint) return null
   const { method, origin, path } = endpoint
   if (
-    !boundedString(method, 32) || !/^[A-Z!#$%&'*+.^_`~0-9|-]+$/.test(method) ||
+    !isValidHttpMethod(method) ||
     !boundedString(origin, 512) ||
     !boundedString(path, 4_096) || !path.startsWith('/')
   ) return null

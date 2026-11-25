@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
-import type { CatalogEntry, IgnoreRule } from '../../lib/model'
+import type { CatalogEntry, IgnoreRule, RouteGrouping } from '../../lib/model'
 import { ignoreKey, ignoreLabel, matchesIgnore, parseIgnorePrefix, type RequestFilter } from '../../lib/request-filters'
 
 const props = defineProps<{
@@ -8,6 +8,7 @@ const props = defineProps<{
   entries: CatalogEntry[]
   ignores: IgnoreRule[]
   activeKeys: string[]
+  routeGrouping?: RouteGrouping
   busy: boolean
 }>()
 
@@ -15,6 +16,7 @@ const emit = defineEmits<{
   filter: [value: RequestFilter]
   add: [rules: IgnoreRule[]]
   remove: [keys: string[]]
+  'route-grouping': [mode: RouteGrouping]
 }>()
 
 const filters: { value: RequestFilter; label: string }[] = [
@@ -93,8 +95,13 @@ function addPrefixes() {
             v-if="option.value === 'ignored' && ignoredCount" class="filter-number">{{ ignoredCount }}</span>
         </button>
       </div>
-      <button ref="settingsButton" type="button" class="button button-text filter-settings"
-        :aria-expanded="expanded" aria-controls="ignore-settings" @click="toggleSettings">忽略规则</button>
+      <div class="filter-tools">
+        <button type="button" class="filter-option" :aria-pressed="routeGrouping === 'ignore-query'" :disabled="busy"
+          title="开启后忽略页面 URL 中的查询参数（如翻页 ?page=2），按页面路径归组接口与规则"
+          @click="emit('route-grouping', routeGrouping === 'ignore-query' ? 'exact' : 'ignore-query')">忽略参数</button>
+        <button ref="settingsButton" type="button" class="button button-text filter-settings"
+          :aria-expanded="expanded" aria-controls="ignore-settings" @click="toggleSettings">忽略规则</button>
+      </div>
     </div>
 
     <section v-if="expanded" id="ignore-settings" class="ignore-settings" aria-label="站点忽略规则" @keydown.esc.stop="closeSettings">
@@ -131,7 +138,7 @@ function addPrefixes() {
 <style scoped>
 .request-filters { flex: none; min-width: 0; padding: 0 var(--workbench-gutter) .5rem; }
 .filter-line { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .125rem .5rem; }
-.filter-options { display: flex; flex-wrap: wrap; align-items: center; gap: .1875rem; min-width: 0; }
+.filter-options, .filter-tools { display: flex; flex-wrap: wrap; align-items: center; gap: .1875rem; min-width: 0; }
 .filter-option {
   display: inline-flex; align-items: center; justify-content: center; gap: .25rem;
   min-height: 1.5625rem; padding: .1875rem .4375rem; border: 1px solid transparent;

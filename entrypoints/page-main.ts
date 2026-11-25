@@ -31,7 +31,7 @@ type Launch = { snapshot: Snapshot; route: string; startedAt: number; stopSignal
 type Call = { launch: Launch; event: RequestEvent }
 type XhrLaunch = { launch: Launch; timeout: number; call?: Call; forwarded?: boolean; forcedTimeout?: boolean }
 type Decision =
-  | { kind: 'forward'; candidate: boolean }
+  | { kind: 'forward'; candidate: boolean; detail?: string }
   | { kind: 'mock'; response: Response; rule: Rule }
   | { kind: 'failure'; error: Error; phase: 'cancelled' | 'error'; detail: string; ruleId?: string; timeout?: boolean }
 
@@ -86,20 +86,26 @@ function installPageAdapter(page: PageWindow): void {
   const nativeXhr = page.XMLHttpRequest
   const xhrInterceptor = new XMLHttpRequestInterceptor()
   const xhrLaunches = new WeakMap<XMLHttpRequest, XhrLaunch>()
-  const startupXhrs = new WeakMap<XMLHttpRequest, { route: string; time: number; timeout: number; forcedTimeout?: boolean }>()
+  const startupXhrs = new WeakMap<XMLHttpRequest, { url: string; time: number; timeout: number; forcedTimeout?: boolean }>()
   let currentWork = new AbortController()
   const routeWork = new Map<string, AbortController>()
+  const ruleHits = new Map<string, number>()
   let sample: { id: string; session: string; route: string; endpoint: Endpoint; expiresAt: number } | null = null
+
+  function currentRoute(url = page.location.href): string {
+    return routeKey(url, configuration?.routeGrouping ?? 'exact')
+  }
 
   function stopWork(): void {
     currentWork.abort(abortError())
     for (const controller of routeWork.values()) controller.abort(abortError())
     routeWork.clear()
+    ruleHits.clear()
     currentWork = new AbortController()
     sample = null
   }
 
-  function launch(initiatingRoute = routeKey(page.location.href), initiatingTime = Date.now()): Launch | null {
+  function launch(initiatingRoute = currentRoute(), initiatingTime = Date.now()): Launch | null {
     if (!configuration || configuration.siteOrigin !== page.location.origin) return null
     if (!configuration.observing && configuration.rules.length === 0) return null
     let work = routeWork.get(initiatingRoute)
@@ -178,6 +184,13 @@ function installPageAdapter(page: PageWindow): void {
         }
       }
       const { rule } = match
+      if (rule.maxHits !== undefined) {
+        const used = ruleHits.get(rule.id) ?? 0
+        if (used >= rule.maxHits) {
+          return { kind: 'forward', candidate: true, detail: `已达本轮 ${rule.maxHits} 次生效上限，已放行真实请求` }
+        }
+        ruleHits.set(rule.id, used + 1)
+      }
       ruleId = rule.id
       if (rule.response.delayMs > 0) {
         announce(call, { phase: 'delay', ruleId, detail: `延迟 ${rule.response.delayMs} 毫秒` })
@@ -216,7 +229,7 @@ function installPageAdapter(page: PageWindow): void {
       capture.session !== call.launch.snapshot.session ||
       capture.expiresAt < Date.now() ||
       capture.route !== call.launch.route ||
-      capture.route !== routeKey(page.location.href) ||
+      capture.route !== currentRoute() ||
       !endpointCovers(capture.endpoint, call.event.endpoint)
     ) return
 
@@ -230,7 +243,7 @@ function installPageAdapter(page: PageWindow): void {
       const copy = response.clone()
       void readLimitedText(copy.body, SAMPLE_LIMIT, call.launch.stopSignal, SAMPLE_READ_TIMEOUT_MS).then(
         (body) => {
-          if (configuration?.observing && capture.route === routeKey(page.location.href)) {
+          if (configuration?.observing && capture.route === currentRoute()) {
             announce(call, { ...fields, sample: body, sampleId: capture.id })
           }
         },
@@ -304,7 +317,7 @@ function installPageAdapter(page: PageWindow): void {
       return decision.response
     }
     if (decision.candidate) {
-      announce(call, { phase: 'bypassed', detail: '请求条件未匹配' })
+      announce(call, { phase: 'bypassed', detail: decision.detail ?? '请求条件未匹配' })
     }
     return forwardFetch(call, request.signal, send)
   }
@@ -339,13 +352,13 @@ function installPageAdapter(page: PageWindow): void {
     }
     if (!initiallyHeld) return run(start)
 
-    const route = routeKey(page.location.href)
+    const url = page.location.href
     const time = Date.now()
     const waited = details?.signal ? awaitAbortable(gate.wait(), details.signal) : gate.wait()
     return waited.then(allow => {
       details?.signal?.throwIfAborted()
       if (!allow) throw startupBlockedError()
-      return run(launch(route, time))
+      return run(launch(currentRoute(url), time))
     })
   }
 
@@ -360,7 +373,7 @@ function installPageAdapter(page: PageWindow): void {
         if (remaining !== undefined && remaining <= 0) throw new DOMException('The request timed out', 'TimeoutError')
         const signal = remaining === undefined ? request.signal : AbortSignal.any([request.signal, AbortSignal.timeout(remaining)])
         if (!await awaitAbortable(gate.wait(), signal)) throw startupBlockedError()
-        const ready = launch(held.route, held.time)
+        const ready = launch(currentRoute(held.url), held.time)
         if (!ready) return
         started = { launch: ready, timeout: held.timeout }
         xhrLaunches.set(xhr, started)
@@ -380,7 +393,7 @@ function installPageAdapter(page: PageWindow): void {
 
     if (decision.kind === 'forward') {
       started.forwarded = true
-      if (decision.candidate) announce(call, { phase: 'bypassed', detail: '请求条件未匹配' })
+      if (decision.candidate) announce(call, { phase: 'bypassed', detail: decision.detail ?? '请求条件未匹配' })
       return
     }
     if (decision.kind === 'failure') {
@@ -439,7 +452,7 @@ function installPageAdapter(page: PageWindow): void {
             const previous = xhrLaunches.get(xhr)
             const start = gate.holdsRequests ? null : launch()
             if (gate.holdsRequests) {
-              startupXhrs.set(xhr, { route: routeKey(page.location.href), time: Date.now(), timeout: xhr.timeout })
+              startupXhrs.set(xhr, { url: page.location.href, time: Date.now(), timeout: xhr.timeout })
             } else startupXhrs.delete(xhr)
             if (start) xhrLaunches.set(xhr, { launch: start, timeout: xhr.timeout })
             else xhrLaunches.delete(xhr)
@@ -505,6 +518,7 @@ function installPageAdapter(page: PageWindow): void {
       revision: configuration?.revision ?? 0,
       activeCount: configuration?.rules.length ?? 0,
       observing: configuration?.observing ?? false,
+      routeGrouping: configuration?.routeGrouping,
       sampleId: sample?.id,
       intact: page.fetch === patchedFetch && page.XMLHttpRequest === patchedXhr,
       startupArmed,
@@ -524,6 +538,7 @@ function installPageAdapter(page: PageWindow): void {
           controller.abort(abortError())
           routeWork.delete(route)
         }
+        ruleHits.clear()
         sample = null
       }
       configuration = command
@@ -537,7 +552,7 @@ function installPageAdapter(page: PageWindow): void {
         configuration = { ...configuration, observing: command.enabled }
         if (!command.enabled) sample = null
       } else if (command.type === 'sample') {
-        if (configuration.observing && command.routeKey === routeKey(page.location.href) &&
+        if (configuration.observing && command.routeKey === currentRoute() &&
             typeof command.id === 'string' && Number.isFinite(command.expiresAt) && command.expiresAt > Date.now()) {
           sample = {
             id: command.id,

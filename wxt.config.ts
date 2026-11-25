@@ -13,7 +13,7 @@ export default defineConfig({
   manifest: {
     name: 'APIFaultLab 接口异常测试',
     description: '在当前开发页面模拟接口异常，查看命中结果并复用测试方案。',
-    minimum_chrome_version: '142',
+    minimum_chrome_version: '128',
     icons: { 16: 'icons/mark-16.png', 32: 'icons/mark-32.png', 48: 'icons/mark-48.png', 128: 'icons/mark-128.png' },
     action: {
       default_title: '打开 APIFaultLab',

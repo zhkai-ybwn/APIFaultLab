@@ -1,6 +1,6 @@
 {
   "name": "api-fault-lab",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -26,5 +26,8 @@
     "vitest": "5.1.1",
     "vue-tsc": "3.3.14",
     "wxt": "0.21.5"
+  },
+  "volta": {
+    "node": "24.22.3"
   }
 }

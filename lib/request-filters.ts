@@ -1,5 +1,5 @@
 import type { CatalogEntry, Endpoint, IgnoreRule } from './model'
-import { endpointCovers, endpointKey } from './rules'
+import { endpointCovers, endpointKey, isValidHttpMethod } from './rules'
 
 export type RequestFilter = 'all' | 'api' | 'static' | 'map' | 'active' | 'ignored'
 
@@ -12,7 +12,6 @@ const STATIC_DIRECTORY = /^\/(?:assets|fonts|images|img|locales|static)(?:\/|$)/
 const MAP_TILE_PATH = /\/\d+\/\d+\/\d+\.(?:avif|jpe?g|png|webp)$/i
 const MAP_VECTOR_TILE = /\.(?:mvt|pbf)$/i
 const MAP_STYLE = /(?:^|\/)styles\/.*\/style\.json$|\/(?:tiles?|tilejson)\/.*\.json$/i
-const METHOD = /^[!#$%&'*+.^_`|~\dA-Z-]+$/
 
 export function classifyEndpoint(entry: CatalogEntry): RequestCategory {
   if (entry.endpoint.method !== 'GET' && entry.endpoint.method !== 'HEAD') return 'api'
@@ -80,7 +79,7 @@ export function normalizeIgnoreRule(rule: IgnoreRule): IgnoreRule {
   if (rule.kind !== 'endpoint' || !rule.endpoint) throw new Error('忽略规则无效')
   const { origin, path, method, template } = rule.endpoint
   const url = new URL(origin)
-  if (!['http:', 'https:'].includes(url.protocol) || url.origin !== origin || typeof method !== 'string' || !METHOD.test(method)) {
+  if (!['http:', 'https:'].includes(url.protocol) || url.origin !== origin || !isValidHttpMethod(method)) {
     throw new Error('忽略接口的地址或方法无效')
   }
   validatePath(path)

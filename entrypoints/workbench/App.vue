@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, reactive, ref, shallowRef, watch } from 'vue'
-import type { CatalogEntry, CatalogOperation, CustomScenario, IgnoreRule, PanelCommand, RequestEvent, Rule, SavedPlan } from '../../lib/model'
+import type { CatalogEntry, CatalogOperation, CustomScenario, IgnoreRule, PanelCommand, RequestEvent, RouteGrouping, Rule, SavedPlan } from '../../lib/model'
 import { ignoreKey, matchesIgnore, matchesRequestFilter, type RequestFilter } from '../../lib/request-filters'
 import { endpointCovers, endpointKey, validateRuleSet } from '../../lib/rules'
 import { usePanelConnection } from '../../lib/use-panel-connection'
@@ -13,7 +13,7 @@ import RuleEditor from './RuleEditor.vue'
 import ScenarioLibrary from './ScenarioLibrary.vue'
 import ScenarioPicker from './ScenarioPicker.vue'
 import { batchAddsBroadScope, compileBatchRow, describeBatchScope, describeCondition, prepareBatch, type BatchWork } from './batch'
-import { applyScenario, createDraft, draftRule, type RuleDraft, type ScenarioChoice, type ScenarioSeed } from './editor'
+import { applyScenario, createDraft, draftHeaders, draftRule, type RuleDraft, type ScenarioChoice, type ScenarioSeed } from './editor'
 import { compilePlanDraft, hasBroadPlanRule, preparePlanDraft, type PlanDraft } from './plan-draft'
 
 interface EditingRule { key: string; originalId?: string; draft: RuleDraft }
@@ -67,6 +67,7 @@ const rules = computed(() => snapshot.value?.rules ?? [])
 const ruleOutcomes = computed(() => new Map(snapshot.value?.ruleOutcomes?.map(outcome => [outcome.ruleId, outcome])))
 const ignores = computed(() => snapshot.value?.ignores ?? [])
 const scenarios = computed(() => snapshot.value?.scenarios ?? [])
+const routeGrouping = computed<RouteGrouping>(() => snapshot.value?.routeGrouping ?? 'exact')
 const entryByKey = computed(() => new Map(entries.value.map(entry => [entry.key, entry])))
 const rulesByEntry = computed(() => new Map(entries.value.map(entry => [entry.key,
   rules.value.filter(rule => endpointKey(rule.endpoint) === entry.key || endpointCovers(rule.endpoint, entry.endpoint)),
@@ -99,11 +100,15 @@ const statusLabel = computed(() => {
 })
 const displayRoute = computed(() => {
   try {
-    const page = new URL(snapshot.value?.pageUrl ?? '')
+    const page = new URL(target.value?.routeKey || snapshot.value?.pageUrl || '')
     return { path: `${page.pathname}${page.search}${page.hash}`, host: page.host }
   } catch {
     return { path: '未连接到网页', host: '' }
   }
+})
+const routeTitle = computed(() => {
+  const url = snapshot.value?.pageUrl || ''
+  return routeGrouping.value === 'ignore-query' && url ? `${url}（按路径归组，已忽略查询参数）` : url
 })
 const visible = computed(() => {
   const keyword = work.value.filter.trim().toLowerCase()
@@ -451,6 +456,7 @@ function batchScenario(choice: ScenarioChoice) {
   for (const { row, entry } of batchEntries.value) {
     const outcome = applyScenario(choice, entry)
     row.draft.response = outcome.response
+    row.draft.headers = draftHeaders(outcome.response.headers)
     row.draft.allowInvalidJson = outcome.allowInvalidJson
   }
 }
@@ -530,6 +536,14 @@ async function authorizeSite(early = false) {
 
 async function resumeObserving() {
   if (target.value) await command({ type: 'set-observing', target: target.value, enabled: true })
+}
+
+async function setRouteGrouping(mode: RouteGrouping) {
+  if (!target.value) return
+  await command(
+    { type: 'set-route-grouping', target: target.value, mode },
+    mode === 'ignore-query' ? '已开启忽略查询参数，翻页或筛选时保持同一组。' : '已恢复按完整页面地址归组。',
+  )
 }
 
 async function addImport(imported: CatalogEntry[], mode?: 'replace', expectedKeys?: string[]) {
@@ -698,10 +712,13 @@ function ruleOutcomeLabel(ruleId: string) {
   return result.hitCount ? `本轮命中 ${result.hitCount} 次 · 最近 ${latest}` : latest
 }
 
-function responseLabel({ response }: Pick<Rule, 'response'>) {
+function responseLabel({ response, maxHits, headersCount }: Pick<Rule, 'response' | 'maxHits'> & { headersCount?: number }) {
   const delay = response.delayMs ? ` · 延迟 ${response.delayMs} ms` : ''
   const retry = response.kind === 'http' && response.retryAfterSeconds !== undefined ? ` · Retry-After ${response.retryAfterSeconds} s` : ''
-  return `${response.kind === 'network' ? '网络错误' : `HTTP ${response.status}`}${delay}${retry}`
+  const customHeaders = response.kind === 'http' ? (headersCount ?? Object.keys(response.headers ?? {}).length) : 0
+  const headersNote = customHeaders ? ` · ${customHeaders} 个自定义头` : ''
+  const limit = maxHits ? ` · 限 ${maxHits} 次` : ''
+  return `${response.kind === 'network' ? '网络错误' : `HTTP ${response.status}`}${delay}${retry}${headersNote}${limit}`
 }
 
 function viewPlan(plan: SavedPlan) {
@@ -729,7 +746,7 @@ function handleEscape() {
         <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M7 5.5 3.5 12 7 18.5m10 0 3.5-6.5L17 5.5M10 17l4-10" /></svg></span>
         <h1>APIFaultLab</h1>
       </div>
-      <div class="route-context" aria-label="当前页面" :title="snapshot?.pageUrl || ''">
+      <div class="route-context" aria-label="当前页面" :title="routeTitle">
         <span v-if="displayRoute.host" class="route-host mono">{{ displayRoute.host }}</span>
         <span class="route-path mono">{{ displayRoute.path }}</span>
       </div>
@@ -792,7 +809,8 @@ function handleEscape() {
           <input v-model="work.filter" class="input" type="search" placeholder="筛选方法、路径或名称" aria-label="筛选请求" />
         </label>
         <RequestFilters v-if="target" :key="snapshot?.siteOrigin" :filter="work.requestFilter" :entries="entries" :ignores="ignores"
-          :active-keys="activeKeys" :busy="busy || !canPersist" @filter="work.requestFilter = $event" @add="addIgnores" @remove="removeIgnores" />
+          :active-keys="activeKeys" :route-grouping="routeGrouping" :busy="busy || !canPersist"
+          @filter="work.requestFilter = $event" @add="addIgnores" @remove="removeIgnores" @route-grouping="setRouteGrouping" />
         <p v-if="snapshot?.catalogAtCapacity" class="subtle catalog-note" role="status">请求记录达到上限，优先保留有规则的请求和业务接口。</p>
 
         <div v-if="entries.length" class="request-columns">
@@ -881,7 +899,7 @@ function handleEscape() {
 
         <div v-if="activePane === 'request' && editor && inspectedEntry" class="inspector-action">
           <div class="inspector-action-copy">
-            <p class="mono">{{ responseLabel({ response: editor.draft.response }) }}</p>
+            <p class="mono">{{ responseLabel({ response: editor.draft.response, maxHits: editor.draft.maxHits, headersCount: editor.draft.headers.filter(item => item.name.trim()).length }) }}</p>
             <p class="subtle">{{ editingScope }}</p>
           </div>
           <div class="button-row compact">
@@ -971,6 +989,9 @@ function handleEscape() {
                   <li v-for="(condition, index) in rule.conditions" :key="index" class="mono">{{ describeCondition(condition) }}</li>
                 </ul>
                 <p v-else class="subtle">匹配该端点的所有操作。</p>
+                <dl v-if="rule.response.headers && Object.keys(rule.response.headers).length" class="plan-notes">
+                  <template v-for="(value, name) in rule.response.headers" :key="name"><dt class="mono">{{ name }}</dt><dd class="mono">{{ value }}</dd></template>
+                </dl>
                 <pre v-if="rule.response.body" class="response-preview mono">{{ rule.response.body }}</pre>
               </details>
             </div>
@@ -992,7 +1013,7 @@ function handleEscape() {
                 <button class="button button-text batch-item-title" type="button" :aria-expanded="work.batchExpanded === row.draft.id"
                   @click="work.batchExpanded = work.batchExpanded === row.draft.id ? null : row.draft.id">
                   <span class="mono" :title="`${entry.endpoint.origin}${entry.endpoint.path}`">{{ entry.endpoint.method }} {{ entry.endpoint.path }}</span>
-                  <span class="subtle">{{ row.original ? '更新' : '新增' }} · {{ responseLabel({ response: row.draft.response }) }}</span>
+                  <span class="subtle">{{ row.original ? '更新' : '新增' }} · {{ responseLabel({ response: row.draft.response, maxHits: row.draft.maxHits, headersCount: row.draft.headers.filter(item => item.name.trim()).length }) }}</span>
                 </button>
                 <p class="subtle mono scope-copy">{{ entry.endpoint.origin }}<template v-if="entry.endpoint.template"> · 路径模板</template></p>
                 <ul v-if="conditions.length" class="rule-scope subtle mono" aria-label="匹配条件，全部满足">

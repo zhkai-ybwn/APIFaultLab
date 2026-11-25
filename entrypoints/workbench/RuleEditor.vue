@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, ref, shallowRef, useId } from 'vue'
-import type { CatalogEntry, CustomScenario, ResponseSampleState } from '../../lib/model'
+import type { CatalogEntry, CustomScenario, RequestCondition, ResponseSampleState } from '../../lib/model'
 import { applyScenario, presetResponse, presets, sameScenarioResponse, scenarioKey, type ScenarioChoice, type ScenarioSeed } from '../../lib/scenarios'
-import { emptyWithStructure, newCondition, type RuleDraft } from './editor'
+import { compileDraftHeaders, draftHeaders, emptyWithStructure, newCondition, newResponseHeader, type RuleDraft } from './editor'
 import ScenarioPicker from './ScenarioPicker.vue'
 
 const props = defineProps<{
@@ -34,8 +34,17 @@ const structureError = ref('')
 const baseJson = computed(() => props.entry.sample ?? props.entry.example?.body)
 const noBody = computed(() => props.entry.endpoint.method === 'HEAD' || [204, 205].includes(props.draft.response.status))
 const lastChoice = shallowRef<ScenarioChoice>()
+const currentResponse = computed(() => {
+  if (props.draft.response.kind !== 'http') return props.draft.response
+  try {
+    const headers = compileDraftHeaders(props.draft.headers)
+    return { ...props.draft.response, ...(headers ? { headers } : { headers: undefined }) }
+  } catch {
+    return props.draft.response
+  }
+})
 const selectedPreset = computed(() => {
-  const response = props.draft.response
+  const response = currentResponse.value
   if (lastChoice.value) {
     const choice = applyScenario(lastChoice.value, props.entry)
     if (props.draft.allowInvalidJson === choice.allowInvalidJson && sameScenarioResponse(response, choice.response)) {
@@ -54,6 +63,7 @@ const selectedPreset = computed(() => {
 function choosePreset(choice: ScenarioChoice) {
   const { response, allowInvalidJson } = applyScenario(choice, props.entry)
   props.draft.response = response
+  props.draft.headers = draftHeaders(response.headers)
   props.draft.allowInvalidJson = allowInvalidJson
   lastChoice.value = choice
   structureError.value = ''
@@ -62,6 +72,24 @@ function choosePreset(choice: ScenarioChoice) {
 function editRetry(event: Event) {
   const input = event.target as HTMLInputElement
   props.draft.response.retryAfterSeconds = input.value ? input.valueAsNumber : undefined
+}
+
+function editMaxHits(event: Event) {
+  const input = event.target as HTMLInputElement
+  props.draft.maxHits = input.value ? input.valueAsNumber : undefined
+}
+
+function conditionMeta(source: RequestCondition['source']) {
+  if (source === 'query') return { title: '查询参数', field: '参数名', fieldPlaceholder: 'page', valuePlaceholder: '1' }
+  if (source === 'header') return { title: '请求头', field: '请求头名称', fieldPlaceholder: 'X-Action', valuePlaceholder: 'ListOrders' }
+  return { title: 'JSON 字段', field: 'JSON 路径', fieldPlaceholder: '/operationName', valuePlaceholder: 'ListOrders' }
+}
+
+function saveAsScenario() {
+  emit('save-scenario', {
+    response: { ...currentResponse.value, ...(currentResponse.value.headers ? { headers: { ...currentResponse.value.headers } } : {}) },
+    allowInvalidJson: props.draft.allowInvalidJson,
+  })
 }
 
 function useSample() {
@@ -73,7 +101,8 @@ function useSample() {
 
 function useExample() {
   if (!props.entry.example) return
-  props.draft.response = { ...props.entry.example }
+  props.draft.response = { ...props.entry.example, ...(props.entry.example.headers ? { headers: { ...props.entry.example.headers } } : {}) }
+  props.draft.headers = draftHeaders(props.entry.example.headers)
   props.draft.allowInvalidJson = false
 }
 
@@ -103,21 +132,21 @@ function preserveStructure() {
       <p v-if="!conditionsOpen" class="subtle">{{ draft.conditions.length ? `已设置 ${draft.conditions.length} 条条件` : '匹配此端点的所有操作' }}</p>
     </div>
     <div v-if="!lockConditions && conditionsOpen" :id="`${id}-conditions`" class="editor-section">
-      <p class="subtle">全部条件同时满足时生效。JSON 路径示例 /operationName。</p>
+      <p class="subtle">全部条件同时满足时生效。JSON 路径示例 /operationName，请求头名称不区分大小写。</p>
       <div v-for="(condition, index) in draft.conditions" :key="condition.id" class="condition">
         <div class="condition-top">
-          <span class="field-label">{{ condition.source === 'query' ? '查询参数' : 'JSON 字段' }}</span>
+          <span class="field-label">{{ conditionMeta(condition.source).title }}</span>
           <button type="button" class="button button-text button-danger" :disabled="busy" :aria-label="`移除条件 ${index + 1}`"
             @click="draft.conditions.splice(index, 1)">移除</button>
         </div>
         <div class="editor-grid">
           <label class="field">
-            <span>{{ condition.source === 'query' ? '参数名' : 'JSON 路径' }}</span>
-            <input v-model="condition.path" class="input mono" :disabled="busy" :placeholder="condition.source === 'query' ? 'page' : '/operationName'" />
+            <span>{{ conditionMeta(condition.source).field }}</span>
+            <input v-model="condition.path" class="input mono" :disabled="busy" :placeholder="conditionMeta(condition.source).fieldPlaceholder" />
           </label>
           <label class="field">
             <span>等于</span>
-            <input v-model="condition.value" class="input mono" :disabled="busy" :placeholder="condition.source === 'query' ? '1' : 'ListOrders'" />
+            <input v-model="condition.value" class="input mono" :disabled="busy" :placeholder="conditionMeta(condition.source).valuePlaceholder" />
           </label>
         </div>
         <label v-if="condition.source === 'json'" class="check-line subtle">
@@ -128,6 +157,7 @@ function preserveStructure() {
       </div>
       <div class="button-row">
         <button type="button" class="button button-small" :disabled="busy" @click="draft.conditions.push(newCondition('query'))">添加查询条件</button>
+        <button type="button" class="button button-small" :disabled="busy" @click="draft.conditions.push(newCondition('header'))">添加请求头条件</button>
         <button type="button" class="button button-small" :disabled="busy" @click="draft.conditions.push(newCondition('json'))">添加 JSON 条件</button>
       </div>
     </div>
@@ -138,9 +168,9 @@ function preserveStructure() {
       <p v-if="!responseOpen" class="subtle mono">
         {{ draft.response.kind === 'http' ? `HTTP ${draft.response.status}` : '网络错误' }}
         <span v-if="draft.response.delayMs"> · {{ draft.response.delayMs }} 毫秒</span>
+        <span v-if="draft.maxHits"> · 限 {{ draft.maxHits }} 次</span>
       </p>
-      <button type="button" class="button button-text" :disabled="busy"
-        @click="emit('save-scenario', { response: { ...draft.response }, allowInvalidJson: draft.allowInvalidJson })">保存为场景</button>
+      <button type="button" class="button button-text" :disabled="busy" @click="saveAsScenario">保存为场景</button>
     </div>
     <div v-if="responseOpen" :id="`${id}-response`" class="editor-section">
       <div class="editor-grid">
@@ -153,6 +183,10 @@ function preserveStructure() {
           <span>延迟（毫秒）</span>
           <input v-model.number="draft.response.delayMs" class="input mono" type="number" min="0" max="60000" step="1" :disabled="busy" required />
         </label>
+        <label class="field">
+          <span>最多生效次数</span>
+          <input :value="draft.maxHits ?? ''" type="number" min="1" max="1000" step="1" placeholder="不限" class="input mono" :disabled="busy" @input="editMaxHits" />
+        </label>
         <label v-if="draft.response.kind === 'http' && ([429, 503].includes(draft.response.status) || draft.response.retryAfterSeconds !== undefined)" class="field">
           <span>Retry-After（秒）</span>
           <input :value="draft.response.retryAfterSeconds ?? ''" type="number" min="0" step="1" class="input mono" :disabled="busy" @input="editRetry" />
@@ -163,6 +197,30 @@ function preserveStructure() {
           @change="draft.response.kind = ($event.target as HTMLInputElement).checked ? 'network' : 'http'" />
         模拟网络错误
       </label>
+      <div v-if="draft.response.kind === 'http'" class="editor-section">
+        <div class="condition-top">
+          <span class="field-label">自定义响应头（可选）</span>
+          <button type="button" class="button button-text" :disabled="busy || draft.headers.length >= 20"
+            @click="draft.headers.push(newResponseHeader())">添加响应头</button>
+        </div>
+        <div v-for="(header, index) in draft.headers" :key="header.id" class="condition">
+          <div class="condition-top">
+            <span class="subtle">响应头 {{ index + 1 }}</span>
+            <button type="button" class="button button-text button-danger" :disabled="busy" :aria-label="`移除响应头 ${index + 1}`"
+              @click="draft.headers.splice(index, 1)">移除</button>
+          </div>
+          <div class="editor-grid">
+            <label class="field">
+              <span>名称</span>
+              <input v-model="header.name" class="input mono" placeholder="X-Total-Count" :disabled="busy" />
+            </label>
+            <label class="field">
+              <span>值</span>
+              <input v-model="header.value" class="input mono" placeholder="0" :disabled="busy" />
+            </label>
+          </div>
+        </div>
+      </div>
       <template v-if="draft.response.kind === 'http' && !noBody">
         <label class="field">
           <span>响应类型</span>

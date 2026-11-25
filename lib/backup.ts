@@ -1,7 +1,7 @@
-import type { CatalogEntry, CustomScenario, Endpoint, IgnoreRule, MockResponse, RequestCondition, Rule, SavedPlan } from './model'
+import type { CatalogEntry, CustomScenario, Endpoint, IgnoreRule, MockResponse, RequestCondition, RouteGrouping, Rule, SavedPlan } from './model'
 import { normalizeCatalogOperations } from './catalog'
 import { ignoreKey, normalizeIgnoreRule } from './request-filters'
-import { endpointKey, routeKey, validateRuleSet } from './rules'
+import { endpointKey, isValidHttpMethod, normalizeResponseHeaders, routeKey, validateRuleSet } from './rules'
 import { normalizeCustomScenario } from './scenarios'
 
 export const MAX_BACKUP_BYTES = 16 * 1024 * 1024
@@ -9,7 +9,7 @@ const FORMAT = 'apifaultlab-backup'
 const PLAN_FORMAT = 'apifaultlab-plan'
 const RESCUE_FORMAT = 'apifaultlab-rescue'
 const VERSION = 1
-const DATA_FIELDS = ['plans', 'imports', 'ignoresBySite', 'scenarios']
+const DATA_FIELDS = ['plans', 'imports', 'ignoresBySite', 'scenarios', 'routeGroupingBySite']
 const encoder = new TextEncoder()
 
 export interface ImportedEntry {
@@ -23,6 +23,7 @@ export interface LocalData {
   imports: ImportedEntry[]
   ignoresBySite: Record<string, IgnoreRule[]>
   scenarios: CustomScenario[]
+  routeGroupingBySite?: Record<string, RouteGrouping>
 }
 
 interface MergeCounts {
@@ -82,7 +83,7 @@ function endpoint(input: unknown): Endpoint {
   const origin = string(value.origin, '接口来源')
   const path = string(value.path, '接口路径')
   const url = new URL(origin)
-  if (!/^[!#$%&'*+.^_`|~\dA-Z-]+$/.test(method) || !/^https?:$/.test(url.protocol) || url.origin !== origin ||
+  if (!isValidHttpMethod(method) || !/^https?:$/.test(url.protocol) || url.origin !== origin ||
       !path.startsWith('/') || /[?#\\]/.test(path) || (value.template !== undefined && typeof value.template !== 'boolean') ||
       (value.template && !/\{[^{}\/]+\}/.test(path))) invalid('接口')
   return { method, origin, path, template: value.template }
@@ -92,6 +93,9 @@ function response(input: unknown): MockResponse {
   const value = record(input, '模拟响应')
   const { kind } = value
   if (kind !== 'http' && kind !== 'network') invalid('模拟响应类型')
+  const headers = value.headers === undefined
+    ? undefined
+    : normalizeResponseHeaders(record(value.headers, '自定义响应头') as Record<string, string>)
   return {
     kind,
     status: integer(value.status, '状态码'),
@@ -99,13 +103,14 @@ function response(input: unknown): MockResponse {
     contentType: string(value.contentType, '响应类型'),
     delayMs: integer(value.delayMs, '响应延迟'),
     retryAfterSeconds: value.retryAfterSeconds === undefined ? undefined : integer(value.retryAfterSeconds, '重试时间'),
+    ...(headers ? { headers } : {}),
   }
 }
 
 function condition(input: unknown): RequestCondition {
   const value = record(input, '匹配条件')
   const { source, value: expected } = value
-  if (source !== 'query' && source !== 'json') invalid('条件来源')
+  if (source !== 'query' && source !== 'json' && source !== 'header') invalid('条件来源')
   if (expected !== null && typeof expected !== 'string' && typeof expected !== 'boolean' &&
       !(typeof expected === 'number' && Number.isFinite(expected))) invalid('条件值')
   return { source, path: string(value.path, '条件字段'), value: expected }
@@ -113,12 +118,14 @@ function condition(input: unknown): RequestCondition {
 
 function rule(input: unknown): Rule {
   const value = record(input, '方案规则')
+  const maxHits = value.maxHits === undefined ? undefined : integer(value.maxHits, '最多生效次数')
   return {
     id: identifier(value.id, '规则标识'),
     routeKey: string(value.routeKey, '规则页面'),
     endpoint: endpoint(value.endpoint),
     conditions: list(value.conditions, '匹配条件').map(condition),
     response: response(value.response),
+    ...(maxHits !== undefined ? { maxHits } : {}),
   }
 }
 
@@ -173,6 +180,19 @@ function unique<T>(items: T[], key: (item: T) => string, field: string): T[] {
   return items
 }
 
+function readRouteGroupingBySite(input: unknown): Record<string, RouteGrouping> | undefined {
+  if (input === undefined) return undefined
+  const sites = record(input, '站点页面归组')
+  const result: Record<string, RouteGrouping> = {}
+  for (const [site, mode] of Object.entries(sites)) {
+    const url = new URL(site)
+    if (!/^https?:$/.test(url.protocol) || url.origin !== site) invalid('站点页面归组来源')
+    if (mode !== 'exact' && mode !== 'ignore-query') invalid('站点页面归组方式')
+    if (mode === 'ignore-query') result[site] = mode
+  }
+  return Object.keys(result).length ? result : undefined
+}
+
 function readData(input: unknown, legacy = false): LocalData {
   if (legacy && input === undefined) return { plans: [], imports: [], ignoresBySite: {}, scenarios: [] }
   const value = record(input, '本地配置')
@@ -184,11 +204,13 @@ function readData(input: unknown, legacy = false): LocalData {
     if (!/^https?:$/.test(url.protocol) || url.origin !== site) invalid('忽略规则站点')
     return [site, unique(list(input, '站点忽略规则').map(rule => normalizeIgnoreRule(rule as IgnoreRule)), ignoreKey, '忽略规则')]
   }))
+  const routeGroupingBySite = readRouteGroupingBySite(value.routeGroupingBySite)
   return {
     plans: unique(rows('plans', '方案').map(plan), item => item.id, '方案'),
     imports: unique(rows('imports', '导入接口').map(imported), importedKey, '导入接口'),
     ignoresBySite,
     scenarios: unique(rows('scenarios', '自定义场景').map(scenario), item => item.id, '自定义场景'),
+    ...(routeGroupingBySite ? { routeGroupingBySite } : {}),
   }
 }
 
@@ -273,8 +295,30 @@ export function salvageLocalData(input: unknown) {
     }
   }
 
+  if (value.routeGroupingBySite !== undefined) {
+    try {
+      const sites = record(value.routeGroupingBySite, '站点页面归组')
+      const recoveredGrouping: Record<string, RouteGrouping> = {}
+      for (const [site, mode] of Object.entries(sites)) {
+        try {
+          const url = new URL(site)
+          if (!/^https?:$/.test(url.protocol) || url.origin !== site || (mode !== 'exact' && mode !== 'ignore-query')) {
+            invalid('站点页面归组')
+          }
+          if (mode === 'ignore-query') recoveredGrouping[site] = mode
+        } catch {
+          skipped += 1
+        }
+      }
+      if (Object.keys(recoveredGrouping).length) data.routeGroupingBySite = recoveredGrouping
+    } catch {
+      skipped += 1
+    }
+  }
+
   const recovered = data.plans.length + data.imports.length + data.scenarios.length +
-    Object.values(data.ignoresBySite).reduce((total, rules) => total + rules.length, 0)
+    Object.values(data.ignoresBySite).reduce((total, rules) => total + rules.length, 0) +
+    Object.keys(data.routeGroupingBySite ?? {}).length
   return { data, recovered, skipped }
 }
 
@@ -323,15 +367,24 @@ export async function mergeBackup(current: LocalData, incoming: LocalData) {
   for (const [site, rules] of Object.entries(incoming.ignoresBySite)) {
     ignoresBySite[site] = merge(ignoresBySite[site] ?? [], rules, ignoreKey, counts.ignores)
   }
+  const routeGroupingBySite: Record<string, RouteGrouping> = { ...current.routeGroupingBySite }
+  let groupingAdded = false
+  for (const [site, mode] of Object.entries(incoming.routeGroupingBySite ?? {})) {
+    if (!Object.hasOwn(routeGroupingBySite, site) && mode === 'ignore-query') {
+      routeGroupingBySite[site] = mode
+      groupingAdded = true
+    }
+  }
   const merged: LocalData = {
     plans: merge(current.plans, incoming.plans, item => item.id, counts.plans),
     imports: merge(current.imports, incoming.imports, importedKey, counts.imports),
     ignoresBySite,
     scenarios: merge(current.scenarios, incoming.scenarios, item => item.id, counts.scenarios),
+    ...(Object.keys(routeGroupingBySite).length ? { routeGroupingBySite } : {}),
   }
   const digest = await crypto.subtle.digest('SHA-256', encoder.encode(JSON.stringify([current, incoming])))
   const confirmation = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
   const preview: BackupPreview = { ...counts, confirmation }
-  const added = Object.values(counts).some(group => group.added > 0)
+  const added = groupingAdded || Object.values(counts).some(group => group.added > 0)
   return { data: added ? merged : current, preview }
 }
